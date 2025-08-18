@@ -4,16 +4,16 @@ import { Link, useLocation } from "react-router-dom";
 import { ethers } from "ethers";
 
 /**
- * Land Sale — Execute Payment & Receive NFT (MATIC · ETH · USDT · USDC · BTC)
+ * Land Sale — Execute Payment & Receive NFT (ETH · USDT · USDC · BTC)
  *
- * This page assumes the contract is already deployed.
+ * This page assumes the contract is already deployed on **Ethereum**.
  * The buyer:
  *  - selects payment method,
- *  - submits payment (native or ERC-20) or uses the BTC rail,
+ *  - submits payment (native ETH or ERC-20) or uses the BTC rail,
  *  - receives the NFT deed (tokenId shown after mint).
  *
- * Assumed Solidity (same as DeployLandSale.jsx notes):
- *   // Native (MATIC/ETH):
+ * Assumed Solidity:
+ *   // Native (ETH):
  *   function executeSale(address buyer, string calldata tokenURI) external payable returns (uint256);
  *   // or:
  *   function mintDeed(address to, string calldata tokenURI) external payable returns (uint256);
@@ -26,7 +26,7 @@ import { ethers } from "ethers";
  * BTC backend endpoints (you implement):
  *   POST /api/btc/create-invoice  -> { amountUsd|amountBtc, buyerAddress, memo } => { id, address, amountBtc, uri }
  *   GET  /api/btc/status?id=...   -> { settled: boolean, btcTxId?: string }
- *   POST /api/btc/finalize        -> { id, buyerAddress, tokenURI, contractAddress? } => { polygonTxHash }
+ *   POST /api/btc/finalize        -> { id, buyerAddress, tokenURI, contractAddress? } => { ethTxHash }
  */
 
 // Minimal ERC-20 + ERC-721 bits
@@ -39,19 +39,14 @@ const ERC721_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ];
 
-// Known token addresses (edit for your networks)
+// Known token addresses (Ethereum)
 const TOKEN_ADDRESSES = {
-  "137": {
-    // Polygon mainnet
-    USDT: { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6 },
-    USDC: { address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", decimals: 6 },
-  },
   "1": {
     // Ethereum mainnet
     USDT: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6 },
     USDC: { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606EB48", decimals: 6 },
   },
-  // Add your testnets here (e.g., Polygon Amoy 80002) if needed
+  // Add your testnets here if *you* have deployed tokens there
 };
 
 export default function ExecuteLandSale() {
@@ -99,8 +94,7 @@ export default function ExecuteLandSale() {
     artifactJSON: "",
 
     // Payment method & amounts
-    assetType: "MATIC", // "MATIC" | "ETH" | "USDT" | "USDC" | "BTC"
-    priceMatic: "",
+    assetType: "ETH", // "ETH" | "USDT" | "USDC" | "BTC"
     priceEth: "",
     priceUsdt: "",
     priceUsdc: "",
@@ -130,7 +124,6 @@ export default function ExecuteLandSale() {
     if (st.contractAddress) stateUpdates.contractAddress = st.contractAddress;
     if (st.tokenURI) stateUpdates.tokenURI = st.tokenURI;
     if (st.assetType) stateUpdates.assetType = st.assetType;
-    if (st.priceMatic) stateUpdates.priceMatic = st.priceMatic;
     if (st.priceEth) stateUpdates.priceEth = st.priceEth;
     if (st.priceUsdt) stateUpdates.priceUsdt = st.priceUsdt;
     if (st.priceUsdc) stateUpdates.priceUsdc = st.priceUsdc;
@@ -167,7 +160,6 @@ export default function ExecuteLandSale() {
       const lsAssetType = get("landSale:assetType");
       if (lsAssetType && !st.assetType) next.assetType = lsAssetType;
 
-      maybe("landSale:priceMatic", "priceMatic");
       maybe("landSale:priceEth", "priceEth");
       maybe("landSale:priceUsdt", "priceUsdt");
       maybe("landSale:priceUsdc", "priceUsdc");
@@ -207,7 +199,6 @@ export default function ExecuteLandSale() {
     }
     localStorage.setItem("landSale:tokenURI", form.tokenURI || "");
     localStorage.setItem("landSale:assetType", form.assetType || "");
-    localStorage.setItem("landSale:priceMatic", form.priceMatic || "");
     localStorage.setItem("landSale:priceEth", form.priceEth || "");
     localStorage.setItem("landSale:priceUsdt", form.priceUsdt || "");
     localStorage.setItem("landSale:priceUsdc", form.priceUsdc || "");
@@ -220,7 +211,6 @@ export default function ExecuteLandSale() {
     form.contractAddress,
     form.tokenURI,
     form.assetType,
-    form.priceMatic,
     form.priceEth,
     form.priceUsdt,
     form.priceUsdc,
@@ -252,8 +242,6 @@ export default function ExecuteLandSale() {
   // ----------- Helpers -----------
   const planSummary = useMemo(() => {
     switch (form.assetType) {
-      case "MATIC":
-        return "Pay in MATIC (native) — payable call; NFT deed mints on success.";
       case "ETH":
         return "Pay in ETH (native) — payable call; NFT deed mints on success.";
       case "USDT":
@@ -261,7 +249,7 @@ export default function ExecuteLandSale() {
       case "USDC":
         return "Pay in USDC (ERC-20) — approve then contract call; NFT deed mints on success.";
       case "BTC":
-        return "Pay with on-chain BTC; backend finalizes mint on-chain after confirmation.";
+        return "Pay with on-chain BTC; backend finalizes mint on Ethereum after confirmation.";
       default:
         return "";
     }
@@ -279,7 +267,7 @@ export default function ExecuteLandSale() {
   // ----------- EXECUTION -----------
   const [execTxHash, setExecTxHash] = useState("");
   const [mintedTokenId, setMintedTokenId] = useState("");
-  const [polygonTxFromBtc, setPolygonTxFromBtc] = useState("");
+  const [ethTxFromBtc, setEthTxFromBtc] = useState("");
 
   async function executeSaleMint() {
     try {
@@ -292,11 +280,10 @@ export default function ExecuteLandSale() {
       const contract = new ethers.Contract(form.contractAddress, abi, signer);
       const iface = contract.interface;
 
-      // --- Native (MATIC / ETH) ---
-      if (form.assetType === "MATIC" || form.assetType === "ETH") {
-        const amountStr = form.assetType === "MATIC" ? form.priceMatic : form.priceEth;
-        const price = Number(amountStr);
-        if (!Number.isFinite(price) || price <= 0) throw new Error(`Enter a positive ${form.assetType} amount.`);
+      // --- Native (ETH) ---
+      if (form.assetType === "ETH") {
+        const price = Number(form.priceEth);
+        if (!Number.isFinite(price) || price <= 0) throw new Error("Enter a positive ETH amount.");
         const valueWei = ethers.parseEther(String(price));
 
         let tx;
@@ -308,7 +295,7 @@ export default function ExecuteLandSale() {
           throw new Error("Contract missing executeSale/mintDeed for native payments.");
         }
 
-        setStatus(`Submitting ${form.assetType} transaction…`);
+        setStatus("Submitting ETH transaction…");
         const rcpt = await tx.wait();
         setExecTxHash(rcpt.hash);
         const id = tryParseMintedTokenId(rcpt, form.contractAddress, form.buyerAddress);
@@ -448,9 +435,9 @@ export default function ExecuteLandSale() {
             }),
           });
           if (!fin.ok) throw new Error("Finalize failed on backend.");
-          const out = await fin.json(); // { polygonTxHash }
-          setPolygonTxFromBtc(out.polygonTxHash || "");
-          setStatus("BTC confirmed. Backend minted deed NFT on-chain.");
+          const out = await fin.json(); // { ethTxHash }
+          setEthTxFromBtc(out.ethTxHash || "");
+          setStatus("BTC confirmed. Backend minted deed NFT on Ethereum.");
           break;
         }
         await new Promise((r) => setTimeout(r, 5000));
@@ -468,13 +455,12 @@ export default function ExecuteLandSale() {
     const addr = form.streetAddress || "—";
     const county = form.county || "—";
     let price =
-      form.assetType === "MATIC" ? (form.priceMatic ? `${form.priceMatic} MATIC` : "—") :
       form.assetType === "ETH"   ? (form.priceEth   ? `${form.priceEth} ETH`     : "—") :
       form.assetType === "USDT"  ? (form.priceUsdt  ? `${form.priceUsdt} USDT`   : "—") :
       form.assetType === "USDC"  ? (form.priceUsdc  ? `${form.priceUsdc} USDC`   : "—") :
       "—";
     return `LandSale: ${addr}, ${county} County | Price: ${price}`;
-  }, [form.streetAddress, form.county, form.assetType, form.priceMatic, form.priceEth, form.priceUsdt, form.priceUsdc]);
+  }, [form.streetAddress, form.county, form.assetType, form.priceEth, form.priceUsdt, form.priceUsdc]);
 
   // ----------- UI -----------
   return (
@@ -496,7 +482,7 @@ export default function ExecuteLandSale() {
         </div>
       </div>
 
-      <h1 style={styles.h1}>Land Sale — Execute Payment & Receive NFT</h1>
+      <h1 style={styles.h1}>Land Sale — Execute Payment & Receive NFT (Ethereum)</h1>
       <p style={styles.muted}>{planSummary}</p>
 
       <div style={styles.grid2}>
@@ -505,7 +491,7 @@ export default function ExecuteLandSale() {
           <h2 style={styles.h2}>1) Enter Details & Execute</h2>
           <form onSubmit={(e) => e.preventDefault()} style={styles.form}>
             <label style={styles.label}>
-              <span>Contract Address (deployed)</span>
+              <span>Contract Address (deployed on Ethereum)</span>
               <input
                 name="contractAddress"
                 value={form.contractAddress}
@@ -575,7 +561,6 @@ export default function ExecuteLandSale() {
                 onChange={(e) => setForm((s) => ({ ...s, assetType: e.target.value }))}
                 style={styles.input}
               >
-                <option value="MATIC">MATIC (native)</option>
                 <option value="ETH">ETH (native)</option>
                 <option value="USDT">USDT (ERC-20)</option>
                 <option value="USDC">USDC (ERC-20)</option>
@@ -584,19 +569,6 @@ export default function ExecuteLandSale() {
             </label>
 
             {/* Price Inputs by method */}
-            {form.assetType === "MATIC" && (
-              <label style={styles.label}>
-                <span>Price (MATIC)</span>
-                <input
-                  name="priceMatic"
-                  value={form.priceMatic}
-                  onChange={onChange}
-                  inputMode="decimal"
-                  placeholder="e.g., 2500"
-                  style={styles.input}
-                />
-              </label>
-            )}
             {form.assetType === "ETH" && (
               <label style={styles.label}>
                 <span>Price (ETH)</span>
@@ -647,7 +619,7 @@ export default function ExecuteLandSale() {
             <div style={{ borderTop: "1px solid #e6e6e6", paddingTop: 10, marginTop: 8 }}>
               <h3 style={{ margin: "0 0 8px", fontSize: 16 }}>Execute Sale (Mint with Selected Method)</h3>
 
-              {["MATIC", "ETH", "USDT", "USDC"].includes(form.assetType) ? (
+              {["ETH", "USDT", "USDC"].includes(form.assetType) ? (
                 <button
                   type="button"
                   style={{ ...styles.btn, ...styles.btnPrimary }}
@@ -683,10 +655,10 @@ export default function ExecuteLandSale() {
                     </div>
                   )}
 
-                  {polygonTxFromBtc && (
+                  {ethTxFromBtc && (
                     <div style={styles.noteBox}>
                       <div style={{ fontWeight: 600, marginBottom: 6 }}>On-chain Tx (mint from BTC rail)</div>
-                      <div style={styles.monoSmall}>{polygonTxFromBtc}</div>
+                      <div style={styles.monoSmall}>{ethTxFromBtc}</div>
                     </div>
                   )}
                 </>
@@ -718,13 +690,13 @@ export default function ExecuteLandSale() {
           <h2 style={styles.h2}>2) What Happens When You Execute?</h2>
           <ol style={{ paddingLeft: 18, lineHeight: 1.5 }}>
             <li>
-              <strong>Native (MATIC/ETH):</strong> A payable function is called with the amount you enter. On success, the contract mints the deed NFT to the buyer.
+              <strong>Native (ETH):</strong> A payable function is called with the amount you enter. On success, the contract mints the deed NFT to the buyer.
             </li>
             <li>
               <strong>USDT/USDC:</strong> Your wallet approves the contract to spend the tokens, then calls the contract to execute the sale and mint the NFT.
             </li>
             <li>
-              <strong>BTC Rail:</strong> A BTC invoice is created. After sufficient confirmations, your backend calls the contract to mint the NFT to the buyer.
+              <strong>BTC Rail:</strong> A BTC invoice is created. After sufficient confirmations, your backend calls the contract on Ethereum to mint the NFT to the buyer.
             </li>
           </ol>
           <div style={styles.fineprint}>
@@ -829,5 +801,5 @@ const styles = {
     margin: "4px 0 8px",
     textAlign: "left",
   },
-  fineprint: { marginTop: 16, fontSize: 12, color: "#555", textAlign: "left" }, // changed from "justify" to "left"
+  fineprint: { marginTop: 16, fontSize: 12, color: "#555", textAlign: "left" },
 };

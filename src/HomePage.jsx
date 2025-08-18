@@ -231,7 +231,7 @@ export default function HomePage() {
           <li>    A:  The only 3rd party involved is a notary public, but if title insurance is elected that would be through a 3rd party.</li>
           
           <li>10. What types of digital assets are allowed?</li>
-          <li>    A:  Currently, the digital assets that are allowed for transactions include Tether, USD Coin, Bitcoin, Ethereum, and Polygon.</li>
+          <li>    A:  Currently, the digital assets that are allowed for transactions include Tether, USD Coin, Bitcoin, and Ethereum.</li>
         </ul>
       </section>
 
