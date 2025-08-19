@@ -1,72 +1,72 @@
-// src/pages/DeployLandSale.jsx
+// src/DeployLandSale.jsx
 import React, { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ethers } from "ethers";
 
 /**
- * Land Sale — Deploy & Execute (ETH · USDT · USDC · BTC)
- *
- * Mint the NFT deed using the **selected Payment Method**:
- *  - ETH (native)          → payable call (value:)
- *  - USDT / USDC (ERC-20)  → approve → contract call with token address + amount
- *  - BTC (on-chain rail)   → backend mints after BTC confirmation
- *
- * Assumed Solidity (rename if yours differs):
- *   // Native (ETH):
- *   function executeSale(address buyer, string calldata tokenURI) external payable returns (uint256);
- *   // or fallback:
- *   function mintDeed(address to, string calldata tokenURI) external payable returns (uint256);
- *
- *   // ERC-20 (USDT/USDC):
- *   function executeSaleERC20(address buyer, string calldata tokenURI, address token, uint256 amount) external returns (uint256);
- *   // or fallback:
- *   function mintDeedERC20(address to, string calldata tokenURI, address token, uint256 amount) external returns (uint256);
- *
- * BTC backend endpoints (you implement):
- *   POST /api/btc/create-invoice  -> { amountUsd|amountBtc, buyerAddress, memo } => { id, address, amountBtc, uri }
- *   GET  /api/btc/status?id=...   -> { settled: boolean, btcTxId?: string }
- *   POST /api/btc/finalize        -> { id, buyerAddress, tokenURI, contractAddress? } => { ethereumTxHash }
+ * Customer-friendly Land Sale — Execute (ETH · USDT · USDC · BTC)
+ * - Admin pre-deploys contract; app auto-loads ABI & address per network.
+ * - Customer only selects payment, enters postal details, and pays.
  */
 
-// Minimal ERC-20 interface
+// ---- Minimal ABIs ----
+const SALE_ABI = [
+  // Native ETH
+  "function executeSale(address buyer, string tokenURI) payable returns (uint256)",
+  "function mintDeed(address to, string tokenURI) payable returns (uint256)",
+  // ERC-20
+  "function executeSaleERC20(address buyer, string tokenURI, address token, uint256 amount) returns (uint256)",
+  "function mintDeedERC20(address to, string tokenURI, address token, uint256 amount) returns (uint256)",
+];
+
+// ERC-20 interface for approve/decimals
 const ERC20_ABI = [
   "function approve(address spender, uint256 value) public returns (bool)",
-  "function allowance(address owner, address spender) public view returns (uint256)",
   "function decimals() view returns (uint8)",
 ];
 
-// Known token addresses (edit for your networks)
-// chainId: { USDT: {address, decimals}, USDC: {address, decimals} }
+// ---- Known token addresses by chain ----
 const TOKEN_ADDRESSES = {
   "1": {
-    // Ethereum mainnet
     USDT: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6 },
     USDC: { address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606EB48", decimals: 6 },
   },
-  // Add testnets (e.g., Sepolia 11155111) if you have deployed mock tokens there.
+  // "11155111": { USDT: {...}, USDC: {...} } // add your testnet tokens if needed
+};
+
+// ---- Predeployed contract addresses by chain (REPLACE with your addresses) ----
+const PRESET_CONTRACTS = {
+  // Ethereum mainnet
+  "1": "0xYourMainnetContractAddressHere",
+  // Example testnet:
+  // "11155111": "0xYourSepoliaContractAddressHere",
 };
 
 export default function DeployLandSale() {
-  // ----------- FORM (off-chain references + execution config) -----------
+  // ----------- FORM (customer inputs) -----------
   const [form, setForm] = useState({
     legalDescription: "",
     streetAddress: "",
     county: "",
 
-    // Payment method & amounts — NFT will be minted using this selection
     assetType: "ETH", // "ETH" | "USDT" | "USDC" | "BTC"
     priceEth: "",
     priceUsdt: "",
     priceUsdc: "",
     priceBtc: "",
 
+    // Wallet + metadata
     buyerAddress: "",
     tokenURI: "",
+    autoMetadata: true, // NEW: auto-generate tokenURI (on by default)
 
+    // Postal party details
     sellerName: "",
     sellerAddress: "",
     buyerName: "",
     buyerAddressPostal: "",
+
+    // Auto dates (grayed out for customer)
     effectiveDate: "",
     closingDate: "",
   });
@@ -76,33 +76,12 @@ export default function DeployLandSale() {
     setForm((s) => ({ ...s, [name]: value }));
   }
 
-  function fmtDate(iso) {
-    if (!iso) return "________";
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return "________";
-    return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
-  }
-
-  const planSummary = useMemo(() => {
-    switch (form.assetType) {
-      case "ETH":
-        return "Mint deed by paying in ETH (native) — payable contract call.";
-      case "USDT":
-        return "Mint deed by paying in USDT — approve then contract call (ERC-20).";
-      case "USDC":
-        return "Mint deed by paying in USDC — approve then contract call (ERC-20).";
-      case "BTC":
-        return "Mint deed after BTC on-chain confirmation — backend triggers the contract on Ethereum.";
-      default:
-        return "";
-    }
-  }, [form.assetType]);
-
-  // ----------- WALLET / NETWORK -----------
+  // ----------- Wallet / Network -----------
   const [account, setAccount] = useState("");
   const [chainId, setChainId] = useState("");
   const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
+
   const [status, setStatus] = useState("");
 
   async function connectWallet() {
@@ -115,79 +94,94 @@ export default function DeployLandSale() {
       await _provider.send("eth_requestAccounts", []);
       const _signer = await _provider.getSigner();
       const _network = await _provider.getNetwork();
+      const addr = await _signer.getAddress();
+
       setProvider(_provider);
       setSigner(_signer);
-      setAccount(await _signer.getAddress());
-      setChainId(_network.chainId.toString());
-      setStatus("Wallet connected.");
+      setAccount(addr);
+      const cid = _network.chainId.toString();
+      setChainId(cid);
+
+      // Auto-fill buyer wallet
+      setForm((s) => (!s.buyerAddress ? { ...s, buyerAddress: addr } : s));
+
+      // Auto-attach contract for this network
+      const preset = PRESET_CONTRACTS[cid];
+      if (preset && ethers.isAddress(preset)) {
+        setContractAddress(preset);
+        setAbi(SALE_ABI);
+        setStatus(`Connected. Contract auto-selected for chainId ${cid}.`);
+      } else {
+        setStatus(
+          `Connected. No preset contract for chainId ${cid}. (Admin can set one in PRESET_CONTRACTS.)`
+        );
+      }
     } catch (e) {
-      setStatus(e?.message || "Failed to connect wallet.");
+      setStatus(e?.message || "Wallet connection failed.");
     }
   }
 
-  // ----------- ARTIFACT / CONTRACT STATE -----------
-  const [artifactJSON, setArtifactJSON] = useState("");
-  const [abi, setAbi] = useState(null);
-  const [bytecode, setBytecode] = useState(null);
-
-  const [existingAddress, setExistingAddress] = useState("");
+  // ----------- Contract state -----------
+  const [abi, setAbi] = useState(SALE_ABI); // default to minimal ABI
   const [contractAddress, setContractAddress] = useState("");
   const [deployTxHash, setDeployTxHash] = useState("");
 
-  function parseArtifact() {
-    try {
-      const obj = JSON.parse(artifactJSON);
-      const _abi = obj.abi || obj.ABI || null;
-      const _bytecode = obj.bytecode || obj.data?.bytecode?.object || null;
-      if (!_abi || !_bytecode) throw new Error("Could not find `abi` and `bytecode` in the JSON.");
-      setAbi(_abi);
-      setBytecode(_bytecode);
-      setStatus("Artifact parsed. Ready to deploy.");
-    } catch (e) {
-      setStatus(e?.message || "Invalid artifact JSON.");
-    }
-  }
+  // Admin-only toggle: show advanced controls (deploy/paste artifact)
+  const [adminMode, setAdminMode] = useState(false);
 
-  async function deployContract() {
-    try {
-      if (!signer) throw new Error("Connect wallet first.");
-      if (!abi || !bytecode) throw new Error("Paste and parse an artifact JSON first.");
+  // ----------- Auto tokenURI (metadata) -----------
+  const autoTokenURI = useMemo(() => {
+    // Build a small JSON metadata object from current form values
+    const meta = {
+      name: `Land Deed — ${form.streetAddress || "Property"}`,
+      description:
+        "On-chain deed representing a land purchase. This is example metadata; replace with your IPFS workflow as needed.",
+      attributes: [
+        { trait_type: "County", value: form.county || "N/A" },
+        { trait_type: "Seller", value: form.sellerName || "N/A" },
+        { trait_type: "Buyer", value: form.buyerName || "N/A" },
+        { trait_type: "Buyer Wallet", value: form.buyerAddress || "N/A" },
+        { trait_type: "Payment Asset", value: form.assetType },
+      ],
+    };
+    const json = JSON.stringify(meta);
+    // Encode as a data: URI so you don't need to upload to IPFS for testing
+    const base64 =
+      typeof window !== "undefined"
+        ? window.btoa(unescape(encodeURIComponent(json)))
+        : Buffer.from(json, "utf8").toString("base64");
+    return `data:application/json;base64,${base64}`;
+  }, [
+    form.streetAddress,
+    form.county,
+    form.sellerName,
+    form.buyerName,
+    form.buyerAddress,
+    form.assetType,
+  ]);
 
-      const factory = new ethers.ContractFactory(abi, bytecode, signer);
-      const contract = await factory.deploy(); // add constructor args here if your contract needs them
-      setStatus("Deploying…");
-      const receipt = await contract.deploymentTransaction().wait();
-      setContractAddress(contract.target);
-      setDeployTxHash(receipt.hash);
-      setStatus(`Deployed at ${contract.target}`);
-    } catch (e) {
-      setStatus(e?.message || "Deployment failed.");
-    }
-  }
+  const effectiveTokenURI = form.autoMetadata ? autoTokenURI : form.tokenURI;
 
-  function useExisting() {
-    try {
-      if (!ethers.isAddress(existingAddress)) throw new Error("Enter a valid contract address.");
-      setContractAddress(existingAddress);
-      setStatus(`Attached to ${existingAddress}`);
-    } catch (e) {
-      setStatus(e?.message || "Failed to attach.");
-    }
-  }
-
-  // ----------- EXECUTION (MINT USING SELECTED PAYMENT METHOD) -----------
+  // ----------- Execute (mint) -----------
   const [execTxHash, setExecTxHash] = useState("");
+  const [btcInvoice, setBtcInvoice] = useState(null);
+  const [btcQr, setBtcQr] = useState("");
+  const [btcPolling, setBtcPolling] = useState(false);
+  const [ethereumTxFromBtc, setEthereumTxFromBtc] = useState("");
 
   async function executeSaleMint() {
     try {
       if (!signer) throw new Error("Connect wallet first.");
-      if (!ethers.isAddress(contractAddress)) throw new Error("Set a valid contract address.");
-      if (!ethers.isAddress(form.buyerAddress)) throw new Error("Enter a valid buyer wallet address.");
-      if (!form.tokenURI) throw new Error("Enter a Token URI.");
+      if (!ethers.isAddress(contractAddress))
+        throw new Error("No contract for this network. (Admin must configure PRESET_CONTRACTS.)");
+      if (!ethers.isAddress(form.buyerAddress))
+        throw new Error("Enter a valid buyer wallet address.");
+
+      if (!effectiveTokenURI) throw new Error("Missing tokenURI.");
 
       const contract = new ethers.Contract(contractAddress, abi || [], signer);
 
-      // --- Native (ETH) path ---
+      // ---- Native ETH ----
       if (form.assetType === "ETH") {
         const price = Number(form.priceEth);
         if (!Number.isFinite(price) || price <= 0) throw new Error("Enter a positive ETH amount.");
@@ -195,58 +189,62 @@ export default function DeployLandSale() {
 
         let tx;
         if (typeof contract.executeSale === "function") {
-          tx = await contract.executeSale(form.buyerAddress, form.tokenURI, { value: valueWei });
+          tx = await contract.executeSale(form.buyerAddress, effectiveTokenURI, { value: valueWei });
         } else if (typeof contract.mintDeed === "function") {
-          tx = await contract.mintDeed(form.buyerAddress, form.tokenURI, { value: valueWei });
+          tx = await contract.mintDeed(form.buyerAddress, effectiveTokenURI, { value: valueWei });
         } else {
-          throw new Error("Contract missing executeSale/mintDeed for native ETH payments.");
+          throw new Error("Contract missing executeSale/mintDeed for native ETH.");
         }
 
-        setStatus(`Submitting ETH transaction…`);
+        // Auto-set dates (UI side); authoritative date is block.timestamp on-chain
+        const nowIso = new Date().toISOString();
+        setForm((s) => ({ ...s, effectiveDate: nowIso, closingDate: nowIso }));
+
+        setStatus("Submitting ETH transaction…");
         const rcpt = await tx.wait();
         setExecTxHash(rcpt.hash);
-        setStatus("Sale executed and deed NFT minted.");
+        setStatus("Sale executed. Deed NFT minted.");
         return;
       }
 
-      // --- ERC-20 (USDT / USDC) path ---
+      // ---- ERC-20 (USDT/USDC) ----
       if (form.assetType === "USDT" || form.assetType === "USDC") {
         const tmap = TOKEN_ADDRESSES[chainId] || {};
-        const tconf = tmap[form.assetType];
-        if (!tconf?.address) throw new Error(`${form.assetType} not configured for chainId ${chainId}.`);
+        const conf = tmap[form.assetType];
+        if (!conf?.address) throw new Error(`${form.assetType} not configured for chainId ${chainId}.`);
 
-        const token = new ethers.Contract(tconf.address, ERC20_ABI, signer);
-        const decimals = tconf.decimals ?? (await token.decimals?.().catch(() => 6)) ?? 6;
-
+        const token = new ethers.Contract(conf.address, ERC20_ABI, signer);
+        const decimals = conf.decimals ?? (await token.decimals?.().catch(() => 6)) ?? 6;
         const amountStr = form.assetType === "USDT" ? form.priceUsdt : form.priceUsdc;
         const value = ethers.parseUnits(String(amountStr), decimals);
         if (value <= 0n) throw new Error(`Enter a positive ${form.assetType} amount.`);
 
-        // 1) Approve the contract to spend tokens
         setStatus(`Approving ${form.assetType}…`);
         const approveTx = await token.approve(contractAddress, value);
         await approveTx.wait();
 
-        // 2) Execute ERC-20 sale + mint
         let tx;
         if (typeof contract.executeSaleERC20 === "function") {
-          tx = await contract.executeSaleERC20(form.buyerAddress, form.tokenURI, tconf.address, value);
+          tx = await contract.executeSaleERC20(form.buyerAddress, effectiveTokenURI, conf.address, value);
         } else if (typeof contract.mintDeedERC20 === "function") {
-          tx = await contract.mintDeedERC20(form.buyerAddress, form.tokenURI, tconf.address, value);
+          tx = await contract.mintDeedERC20(form.buyerAddress, effectiveTokenURI, conf.address, value);
         } else {
-          throw new Error("Contract missing executeSaleERC20/mintDeedERC20 for token payments.");
+          throw new Error("Contract missing executeSaleERC20/mintDeedERC20.");
         }
+
+        const nowIso = new Date().toISOString();
+        setForm((s) => ({ ...s, effectiveDate: nowIso, closingDate: nowIso }));
 
         setStatus(`Submitting ${form.assetType} transaction…`);
         const rcpt = await tx.wait();
         setExecTxHash(rcpt.hash);
-        setStatus("Sale executed and deed NFT minted.");
+        setStatus("Sale executed. Deed NFT minted.");
         return;
       }
 
-      // --- BTC rail path ---
+      // ---- BTC rail (via backend) ----
       if (form.assetType === "BTC") {
-        setStatus("Use the BTC rail buttons below to create invoice and finalize mint after confirmation.");
+        setStatus("Use the BTC rail buttons below to create invoice and finalize after confirmation.");
         return;
       }
 
@@ -256,40 +254,34 @@ export default function DeployLandSale() {
     }
   }
 
-  // ----------- BTC RAIL (ON-CHAIN BITCOIN, VIA YOUR BACKEND) -----------
-  const [btcInvoice, setBtcInvoice] = useState(null); // { id, address, amountBtc, uri }
-  const [btcQr, setBtcQr] = useState("");
-  const [btcPolling, setBtcPolling] = useState(false);
-  const [ethereumTxFromBtc, setEthereumTxFromBtc] = useState("");
-
   const invoiceMemo = useMemo(() => {
     const addr = form.streetAddress || "—";
     const county = form.county || "—";
     let price =
       form.assetType === "ETH"
-        ? form.priceEth
-          ? `${form.priceEth} ETH`
-          : "—"
+        ? form.priceEth || "—"
         : form.assetType === "USDT"
-        ? form.priceUsdt
-          ? `${form.priceUsdt} USDT`
-          : "—"
+        ? form.priceUsdt || "—"
         : form.assetType === "USDC"
-        ? form.priceUsdc
-          ? `${form.priceUsdc} USDC`
-          : "—"
+        ? form.priceUsdc || "—"
         : form.assetType === "BTC"
-        ? form.priceBtc
-          ? `${form.priceBtc} BTC`
-          : "—"
+        ? form.priceBtc || "—"
         : "—";
-    return `LandSale: ${addr}, ${county} County | Price: ${price}`;
-  }, [form.streetAddress, form.county, form.assetType, form.priceEth, form.priceUsdt, form.priceUsdc, form.priceBtc]);
+    return `LandSale: ${addr}, ${county} County | Price: ${price} ${form.assetType}`;
+  }, [
+    form.streetAddress,
+    form.county,
+    form.assetType,
+    form.priceEth,
+    form.priceUsdt,
+    form.priceUsdc,
+    form.priceBtc,
+  ]);
 
   async function createBtcInvoice() {
     try {
-      if (!form.buyerAddress || !ethers.isAddress(form.buyerAddress)) throw new Error("Enter a valid buyer address (0x...).");
-      if (!form.tokenURI) throw new Error("Enter a Token URI.");
+      if (!form.buyerAddress || !ethers.isAddress(form.buyerAddress))
+        throw new Error("Enter a valid buyer address (0x…).");
       const btcAmt = Number(form.priceBtc);
       if (!Number.isFinite(btcAmt) || btcAmt <= 0) throw new Error("Enter a positive BTC amount.");
 
@@ -297,8 +289,7 @@ export default function DeployLandSale() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          amountUsd: undefined,         // leave undefined if pricing directly in BTC
-          amountBtc: String(btcAmt),    // e.g., "0.015"
+          amountBtc: String(btcAmt),
           buyerAddress: form.buyerAddress,
           memo: invoiceMemo,
         }),
@@ -307,52 +298,61 @@ export default function DeployLandSale() {
       const data = await res.json();
       setBtcInvoice(data);
       const uri = data.uri || `bitcoin:${data.address}`;
-      setBtcQr(`https://api.qrserver.com/v1/create-qr-code/?qzone=1&size=440x440&data=${encodeURIComponent(uri)}`);
+      setBtcQr(
+        `https://api.qrserver.com/v1/create-qr-code/?qzone=1&size=440x440&data=${encodeURIComponent(
+          uri
+        )}`
+      );
       setStatus("BTC invoice created. Awaiting confirmation…");
     } catch (e) {
-      setStatus(e?.message || "Failed to create BTC invoice (backend missing?).");
+      setStatus(e?.message || "Failed to create BTC invoice.");
     }
   }
 
   async function pollBtcAndFinalize() {
     try {
       if (!btcInvoice?.id) throw new Error("No BTC invoice to poll.");
-      if (!form.buyerAddress || !form.tokenURI) throw new Error("Buyer address and Token URI are required.");
-
-      setBtcPolling(true);
-      let settled = false;
-      for (let i = 0; i < 120; i++) {
-        // ~10 minutes if 5s interval
-        const st = await fetch(`/api/btc/status?id=${encodeURIComponent(btcInvoice.id)}`);
-        const s = st.ok ? await st.json() : { settled: false };
-        if (s.settled) {
-          settled = true;
-          // Ask backend to execute on-chain mint now that BTC is confirmed
-          const fin = await fetch("/api/btc/finalize", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              id: btcInvoice.id,
-              buyerAddress: form.buyerAddress,
-              tokenURI: form.tokenURI,
-              contractAddress, // optional hint
-            }),
-          });
-          if (!fin.ok) throw new Error("Finalize failed on backend.");
-          const out = await fin.json(); // { ethereumTxHash }
-          setEthereumTxFromBtc(out.ethereumTxHash || "");
-          setStatus("BTC confirmed. Backend minted deed NFT on Ethereum.");
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 5000));
-      }
-      if (!settled) setStatus("BTC not yet confirmed. Try again later.");
+      if (!ethers.isAddress(contractAddress))
+        throw new Error("No contract address set.");
+      // In a real flow your backend mints with the correct tokenURI (build it server-side too)
+      const fin = await fetch("/api/btc/finalize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: btcInvoice.id,
+          buyerAddress: form.buyerAddress,
+          tokenURI: effectiveTokenURI,
+          contractAddress,
+        }),
+      });
+      if (!fin.ok) throw new Error("Finalize failed on backend.");
+      const out = await fin.json(); // { ethereumTxHash }
+      setEthereumTxFromBtc(out.ethereumTxHash || "");
+      const nowIso = new Date().toISOString();
+      setForm((s) => ({ ...s, effectiveDate: nowIso, closingDate: nowIso }));
+      setStatus("BTC confirmed. Backend minted deed NFT on Ethereum.");
     } catch (e) {
       setStatus(e?.message || "BTC status check/finalize failed.");
-    } finally {
-      setBtcPolling(false);
     }
   }
+
+  const planSummary = useMemo(() => {
+    switch (form.assetType) {
+      case "ETH":
+        return "Mint deed by paying in ETH (native) — payable contract call.";
+      case "USDT":
+        return "Mint deed by paying in USDT — approve then contract call (ERC-20).";
+      case "USDC":
+        return "Mint deed by paying in USDC — approve then contract call (ERC-20).";
+      case "BTC":
+        return "Mint deed after BTC on-chain confirmation — backend triggers the Ethereum mint.";
+      default:
+        return "";
+    }
+  }, [form.assetType]);
+
+  const autoBuyer =
+    account && form.buyerAddress && form.buyerAddress.toLowerCase() === account.toLowerCase();
 
   return (
     <div style={styles.container}>
@@ -371,11 +371,11 @@ export default function DeployLandSale() {
         </div>
       </div>
 
-      <h1 style={styles.h1}>Land Sale — Deploy & Execute (ETH · USDT · USDC · BTC)</h1>
+      <h1 style={styles.h1}>Land Sale — Execute (Customer Mode)</h1>
       <p style={styles.muted}>{planSummary}</p>
 
       <div style={styles.grid2}>
-        {/* LEFT */}
+        {/* LEFT: Customer form */}
         <section style={styles.card}>
           <h2 style={styles.h2}>1) Contract & Payment Details</h2>
 
@@ -433,14 +433,46 @@ export default function DeployLandSale() {
                 <span>Buyer Address (postal)</span>
                 <input name="buyerAddressPostal" value={form.buyerAddressPostal} onChange={onChange} style={styles.input} />
               </label>
+
+              {/* Buyer wallet (auto if connected) */}
               <label style={styles.label}>
-                <span>Buyer Address (wallet)</span>
+                <span>
+                  Buyer Address (wallet){" "}
+                  {autoBuyer && <em style={styles.chipAuto}>auto from connected wallet</em>}
+                </span>
                 <input
                   name="buyerAddress"
                   value={form.buyerAddress}
                   onChange={onChange}
                   placeholder="0x..."
-                  style={styles.input}
+                  style={{ ...styles.input, ...(autoBuyer ? styles.inputDisabled : null) }}
+                  disabled={!!autoBuyer}
+                />
+                <div style={styles.fieldHint}>Connect a wallet to auto-fill this field.</div>
+              </label>
+
+              {/* Auto dates (grayed out) */}
+              <label style={styles.label}>
+                <span>Effective Date <em style={styles.chipAuto}>auto (block.timestamp)</em></span>
+                <input
+                  name="effectiveDate"
+                  value={form.effectiveDate}
+                  onChange={onChange}
+                  placeholder="Auto: set at execution"
+                  style={{ ...styles.input, ...styles.inputDisabled }}
+                  disabled
+                />
+              </label>
+
+              <label style={styles.label}>
+                <span>Closing Date <em style={styles.chipAuto}>auto (execution)</em></span>
+                <input
+                  name="closingDate"
+                  value={form.closingDate}
+                  onChange={onChange}
+                  placeholder="Auto: same as execution"
+                  style={{ ...styles.input, ...styles.inputDisabled }}
+                  disabled
                 />
               </label>
             </div>
@@ -515,80 +547,77 @@ export default function DeployLandSale() {
               </label>
             )}
 
-            {/* NFT metadata */}
-            <label style={styles.label}>
-              <span>NFT Token URI (deed metadata)</span>
-              <input
-                name="tokenURI"
-                value={form.tokenURI}
-                onChange={onChange}
-                placeholder="ipfs://... or https://..."
-                style={styles.input}
-              />
-            </label>
-
-            <div style={styles.helperRow}>
-              <div style={{ fontSize: 13, color: "#57606a", textAlign: "left" }}>
-                <strong>Current Plan:</strong> {planSummary}
-              </div>
-            </div>
-
-            {/* ----------- CONTRACT ARTIFACT / DEPLOY / ATTACH ----------- */}
-            <div style={{ borderTop: "1px solid #e6e6e6", paddingTop: 10, marginTop: 4 }}>
-              <h3 style={{ margin: "0 0 8px", fontSize: 16, textAlign: "left" }}>Contract Controls</h3>
-
-              <label style={styles.label}>
-                <span>Paste Artifact JSON (from Hardhat/Foundry build)</span>
-                <textarea
-                  rows={5}
-                  value={artifactJSON}
-                  onChange={(e) => setArtifactJSON(e.target.value)}
-                  placeholder='{"abi":[...],"bytecode":"0x..."}'
-                  style={styles.textarea}
+            {/* Token metadata (auto) */}
+            <div style={{ display: "grid", gap: 6 }}>
+              <label style={styles.inlineCheck}>
+                <input
+                  type="checkbox"
+                  checked={form.autoMetadata}
+                  onChange={(e) => setForm((s) => ({ ...s, autoMetadata: e.target.checked }))}
                 />
+                <span>Auto-generate token metadata (tokenURI)</span>
               </label>
 
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button type="button" style={styles.btn} onClick={parseArtifact}>Parse Artifact</button>
-                <button type="button" style={{ ...styles.btn, ...styles.btnPrimary }} onClick={deployContract} disabled={!abi || !bytecode || !signer}>
-                  Deploy Contract
-                </button>
-              </div>
-
-              {contractAddress && (
-                <div style={styles.noteBox}>
-                  <div style={{ fontWeight: 600, marginBottom: 6 }}>Deployed / Attached Contract</div>
-                  <div style={{ fontSize: 13, wordBreak: "break-all" }}>
-                    Address: <code>{contractAddress}</code>
-                    {deployTxHash && (
-                      <>
-                        <br />
-                        Deploy Tx: <code>{deployTxHash}</code>
-                      </>
-                    )}
-                  </div>
+              <label style={styles.label}>
+                <span>NFT Token URI (deed metadata)</span>
+                <input
+                  name="tokenURI"
+                  value={form.autoMetadata ? effectiveTokenURI : form.tokenURI}
+                  onChange={onChange}
+                  placeholder="ipfs://... or https://..."
+                  style={{ ...styles.input, ...(form.autoMetadata ? styles.inputDisabled : null) }}
+                  disabled={form.autoMetadata}
+                />
+                <div style={styles.fieldHint}>
+                  Auto mode builds a <code>data:application/json</code> tokenURI from the form. Replace with IPFS in production.
                 </div>
-              )}
-
-              {!contractAddress && (
-                <label style={{ ...styles.label, marginTop: 8 }}>
-                  <span>Or use existing contract address</span>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <input
-                      value={existingAddress}
-                      onChange={(e) => setExistingAddress(e.target.value)}
-                      placeholder="0x..."
-                      style={{ ...styles.input, flex: 1 }}
-                    />
-                    <button type="button" style={styles.btn} onClick={useExisting}>Use Address</button>
-                  </div>
-                </label>
-              )}
+              </label>
             </div>
 
-            {/* ----------- EXECUTION ACTIONS ----------- */}
+            {/* Contract section (customer view) */}
             <div style={{ borderTop: "1px solid #e6e6e6", paddingTop: 10, marginTop: 8 }}>
-              <h3 style={{ margin: "0 0 8px", fontSize: 16, textAlign: "left" }}>Execute Sale (Mint with Selected Method)</h3>
+              <h3 style={{ margin: "0 0 8px", fontSize: 16, textAlign: "left" }}>Contract</h3>
+
+              <label style={styles.label}>
+                <span>Contract Address (auto)</span>
+                <input
+                  value={contractAddress || ""}
+                  onChange={() => {}}
+                  placeholder="Will auto-fill after wallet connect"
+                  style={{ ...styles.input, ...styles.inputDisabled }}
+                  disabled
+                />
+                <div style={styles.fieldHint}>
+                  Set by the app using your predeployed address for this network.
+                </div>
+              </label>
+
+              <details style={{ marginTop: 6 }}>
+                <summary style={{ cursor: "pointer" }} onClick={() => setAdminMode((v) => !v)}>
+                  Admin controls (toggle)
+                </summary>
+
+                {adminMode && (
+                  <div style={{ marginTop: 8 }}>
+                    <AdminControls
+                      abi={abi}
+                      setAbi={setAbi}
+                      setContractAddress={setContractAddress}
+                      setDeployTxHash={setDeployTxHash}
+                      setStatus={setStatus}
+                      provider={provider}
+                      signer={signer}
+                    />
+                  </div>
+                )}
+              </details>
+            </div>
+
+            {/* Execute */}
+            <div style={{ borderTop: "1px solid #e6e6e6", paddingTop: 10, marginTop: 8 }}>
+              <h3 style={{ margin: "0 0 8px", fontSize: 16, textAlign: "left" }}>
+                Execute Sale (Mint with Selected Method)
+              </h3>
 
               {["ETH", "USDT", "USDC"].includes(form.assetType) ? (
                 <button
@@ -610,7 +639,12 @@ export default function DeployLandSale() {
                     >
                       Create BTC Invoice (backend)
                     </button>
-                    <button type="button" style={styles.btn} onClick={pollBtcAndFinalize} disabled={!btcInvoice || btcPolling}>
+                    <button
+                      type="button"
+                      style={styles.btn}
+                      onClick={pollBtcAndFinalize}
+                      disabled={!btcInvoice || btcPolling}
+                    >
                       {btcPolling ? "Checking…" : "Check BTC & Finalize Mint"}
                     </button>
                   </div>
@@ -641,6 +675,13 @@ export default function DeployLandSale() {
               )}
             </div>
 
+            {deployTxHash && (
+              <div style={styles.noteBox}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Deploy Tx</div>
+                <div style={styles.monoSmall}>{deployTxHash}</div>
+              </div>
+            )}
+
             {status && (
               <div style={styles.noteBox}>
                 <div style={{ fontWeight: 600, marginBottom: 6 }}>Status</div>
@@ -662,9 +703,12 @@ export default function DeployLandSale() {
             </div>
 
             <p style={styles.para}>
-              This Land Purchase Agreement (“Agreement”) is made effective as of {fmtDate(form.effectiveDate)} (“Effective Date”) by and between{" "}
-              <span style={styles.smallCaps}>{form.sellerName || "________"}</span>, with a mailing address of {form.sellerAddress || "________"}, as “Seller,” and{" "}
-              <span style={styles.smallCaps}>{form.buyerName || "________"}</span>, with a mailing address of {form.buyerAddressPostal || "________"}, as “Buyer.”
+              This Land Purchase Agreement (“Agreement”) is made effective as of{" "}
+              {fmtDate(form.effectiveDate)} (“Effective Date”) by and between{" "}
+              <span style={styles.smallCaps}>{form.sellerName || "________"}</span>, with a mailing address of{" "}
+              {form.sellerAddress || "________"}, as “Seller,” and{" "}
+              <span style={styles.smallCaps}>{form.buyerName || "________"}</span>, with a mailing address of{" "}
+              {form.buyerAddressPostal || "________"}, as “Buyer.”
             </p>
 
             <ol style={styles.clauses}>
@@ -685,7 +729,7 @@ export default function DeployLandSale() {
                   <>Price: {form.priceUsdc || "________"} USDC. Buyer approves USDC to the contract and executes the sale; the contract mints an NFT deed.</>
                 )}
                 {form.assetType === "BTC" && (
-                  <>Price: {form.priceBtc || "________"} BTC. Buyer pays in on-chain Bitcoin to a designated payment address. After sufficient confirmations, the service triggers a smart contract call on Ethereum to mint the NFT deed to Buyer.</>
+                  <>Price: {form.priceBtc || "________"} BTC. After sufficient confirmations, the service triggers a smart contract call on Ethereum to mint the NFT deed to Buyer.</>
                 )}
               </li>
               <li>
@@ -725,7 +769,7 @@ export default function DeployLandSale() {
 
             <div style={styles.fineprint}>
               <strong>Notice:</strong> This UI mints the NFT using the selected method (ETH, USDT, USDC) or via BTC rail after confirmation.
-              Integrate your own backend for BTC invoice creation and finalize calls. This is not legal advice.
+              This is not legal advice.
             </div>
           </div>
 
@@ -736,7 +780,9 @@ export default function DeployLandSale() {
               onClick={() => {
                 const node = document.getElementById("printArea");
                 const win = window.open("", "_blank", "width=800,height=1000");
-                win.document.write(`<html><head><title>Land Purchase Agreement</title></head><body>${node.innerHTML}</body></html>`);
+                win.document.write(
+                  `<html><head><title>Land Purchase Agreement</title></head><body>${node.innerHTML}</body></html>`
+                );
                 win.document.close();
                 win.focus();
                 win.print();
@@ -752,12 +798,104 @@ export default function DeployLandSale() {
   );
 }
 
+/* ---------- Admin Controls (optional) ---------- */
+function AdminControls({ abi, setAbi, setContractAddress, setDeployTxHash, setStatus, provider, signer }) {
+  const [artifactJSON, setArtifactJSON] = useState("");
+  const [bytecode, setBytecode] = useState("");
+
+  function parseArtifact() {
+    try {
+      const obj = JSON.parse(artifactJSON);
+      const _abi = obj.abi || obj.ABI || null;
+      const _byte = obj.bytecode || obj.data?.bytecode?.object || null;
+      if (!_abi || !_byte) throw new Error("Could not find `abi` and `bytecode`.");
+      setAbi(_abi);
+      setBytecode(_byte);
+      setStatus("Artifact parsed. Ready to deploy.");
+    } catch (e) {
+      setStatus(e?.message || "Invalid artifact JSON.");
+    }
+  }
+
+  async function deployContract() {
+    try {
+      if (!signer) throw new Error("Connect wallet first.");
+      if (!abi || !bytecode) throw new Error("Paste and parse an artifact JSON first.");
+      const factory = new ethers.ContractFactory(abi, bytecode, signer);
+      const contract = await factory.deploy();
+      setStatus("Deploying…");
+      const receipt = await contract.deploymentTransaction().wait();
+      setContractAddress(contract.target);
+      setDeployTxHash(receipt.hash);
+      setStatus(`Deployed at ${contract.target}`);
+    } catch (e) {
+      setStatus(e?.message || "Deployment failed.");
+    }
+  }
+
+  const [existing, setExisting] = useState("");
+
+  return (
+    <div>
+      <h4 style={{ margin: "8px 0" }}>Admin — Contract Controls</h4>
+      <label style={styles.label}>
+        <span>Paste Artifact JSON (from Hardhat/Foundry)</span>
+        <textarea
+          rows={5}
+          value={artifactJSON}
+          onChange={(e) => setArtifactJSON(e.target.value)}
+          placeholder='{"abi":[...],"bytecode":"0x..."}'
+          style={styles.textarea}
+        />
+      </label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button type="button" style={styles.btn} onClick={parseArtifact}>Parse Artifact</button>
+        <button type="button" style={{ ...styles.btn, ...styles.btnPrimary }} onClick={deployContract} disabled={!abi || !bytecode || !signer}>
+          Deploy Contract
+        </button>
+      </div>
+
+      <label style={{ ...styles.label, marginTop: 8 }}>
+        <span>Or use existing contract address</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={existing}
+            onChange={(e) => setExisting(e.target.value)}
+            placeholder="0x..."
+            style={{ ...styles.input, flex: 1 }}
+          />
+          <button
+            type="button"
+            style={styles.btn}
+            onClick={() => {
+              if (!ethers.isAddress(existing)) {
+                setStatus("Enter a valid address.");
+                return;
+              }
+              setContractAddress(existing);
+              setStatus(`Attached to ${existing}`);
+            }}
+          >
+            Use Address
+          </button>
+        </div>
+      </label>
+    </div>
+  );
+}
+
 /* ---------- helpers ---------- */
 function short(addr) {
   return addr ? addr.slice(0, 6) + "…" + addr.slice(-4) : "";
 }
+function fmtDate(iso) {
+  if (!iso) return "________";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "________";
+  return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+}
 
-/* ---------- Inline styles ---------- */
+/* ---------- Styles ---------- */
 const styles = {
   container: {
     maxWidth: 1180,
@@ -765,7 +903,7 @@ const styles = {
     padding: "0 20px",
     color: "#1f2328",
     fontFamily: 'system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif',
-    textAlign: "left", // ← left-align everything by default
+    textAlign: "left",
   },
   toolbar: {
     display: "flex",
@@ -790,7 +928,17 @@ const styles = {
     borderRadius: 8,
     fontSize: 14,
     textAlign: "left",
+    background: "#fff",
+    color: "#111",
   },
+  inputDisabled: {
+    background: "#f3f4f6",
+    color: "#6a737d",
+    cursor: "not-allowed",
+  },
+  inlineCheck: { display: "inline-flex", alignItems: "center", gap: 8, fontSize: 14 },
+  fieldHint: { fontSize: 12, color: "#6a737d", marginTop: 2 },
+  chipAuto: { fontSize: 12, color: "#57606a", paddingLeft: 6 },
   textarea: {
     width: "100%",
     padding: "10px 12px",
@@ -826,7 +974,6 @@ const styles = {
     wordBreak: "break-all",
     textAlign: "left",
   },
-
   noteBox: {
     background: "#fff8e6",
     border: "1px solid #ffe8a3",
@@ -842,7 +989,6 @@ const styles = {
     alignItems: "center",
     margin: "4px 0 8px",
   },
-
   legalPage: {
     background: "#fff",
     border: "1px solid #e6e6e6",
@@ -852,7 +998,7 @@ const styles = {
     fontFamily: 'Georgia,"Times New Roman",Times,serif',
     color: "#111",
     lineHeight: 1.45,
-    textAlign: "left", // ← left-align the legal preview body
+    textAlign: "left",
   },
   docTitle: { fontVariantCaps: "small-caps", letterSpacing: 0.5, fontSize: 22, textAlign: "left" },
   docSubtitle: { fontSize: 12, color: "#555", marginTop: 2, textAlign: "left" },
@@ -866,5 +1012,5 @@ const styles = {
   sigLabel: { fontSize: 14 },
   sigDate: { fontSize: 12, color: "#555" },
   fineprint: { marginTop: 16, fontSize: 12, color: "#555", textAlign: "left" },
-  docActions: { marginTop: 12, display: "flex", gap: 8, justifyContent: "flex-start" }, // ← align actions left
+  docActions: { marginTop: 12, display: "flex", gap: 8, justifyContent: "flex-start" },
 };
