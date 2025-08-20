@@ -7,6 +7,7 @@ import { ethers } from "ethers";
  * Customer-friendly Land Sale — Execute (ETH · USDT · USDC · BTC)
  * - Admin pre-deploys contract; app auto-loads ABI & address per network.
  * - Customer only selects payment, enters postal details, and pays.
+ * - This page now collects the SELLER's wallet (to receive funds off-chain / for records).
  */
 
 // ---- Minimal ABIs ----
@@ -56,9 +57,9 @@ export default function DeployLandSale() {
     priceBtc: "",
 
     // Wallet + metadata
-    buyerAddress: "",
+    sellerWallet: "",      // ← renamed & repurposed
     tokenURI: "",
-    autoMetadata: true, // NEW: auto-generate tokenURI (on by default)
+    autoMetadata: true,    // auto-generate tokenURI (on by default)
 
     // Postal party details
     sellerName: "",
@@ -102,9 +103,6 @@ export default function DeployLandSale() {
       const cid = _network.chainId.toString();
       setChainId(cid);
 
-      // Auto-fill buyer wallet
-      setForm((s) => (!s.buyerAddress ? { ...s, buyerAddress: addr } : s));
-
       // Auto-attach contract for this network
       const preset = PRESET_CONTRACTS[cid];
       if (preset && ethers.isAddress(preset)) {
@@ -140,12 +138,11 @@ export default function DeployLandSale() {
         { trait_type: "County", value: form.county || "N/A" },
         { trait_type: "Seller", value: form.sellerName || "N/A" },
         { trait_type: "Buyer", value: form.buyerName || "N/A" },
-        { trait_type: "Buyer Wallet", value: form.buyerAddress || "N/A" },
+        { trait_type: "Seller Wallet", value: form.sellerWallet || "N/A" }, // ← updated label
         { trait_type: "Payment Asset", value: form.assetType },
       ],
     };
     const json = JSON.stringify(meta);
-    // Encode as a data: URI so you don't need to upload to IPFS for testing
     const base64 =
       typeof window !== "undefined"
         ? window.btoa(unescape(encodeURIComponent(json)))
@@ -156,7 +153,7 @@ export default function DeployLandSale() {
     form.county,
     form.sellerName,
     form.buyerName,
-    form.buyerAddress,
+    form.sellerWallet,
     form.assetType,
   ]);
 
@@ -174,8 +171,8 @@ export default function DeployLandSale() {
       if (!signer) throw new Error("Connect wallet first.");
       if (!ethers.isAddress(contractAddress))
         throw new Error("No contract for this network. (Admin must configure PRESET_CONTRACTS.)");
-      if (!ethers.isAddress(form.buyerAddress))
-        throw new Error("Enter a valid buyer wallet address.");
+      if (!account || !ethers.isAddress(account))
+        throw new Error("Buyer (connected wallet) is not available.");
 
       if (!effectiveTokenURI) throw new Error("Missing tokenURI.");
 
@@ -189,9 +186,9 @@ export default function DeployLandSale() {
 
         let tx;
         if (typeof contract.executeSale === "function") {
-          tx = await contract.executeSale(form.buyerAddress, effectiveTokenURI, { value: valueWei });
+          tx = await contract.executeSale(account, effectiveTokenURI, { value: valueWei });
         } else if (typeof contract.mintDeed === "function") {
-          tx = await contract.mintDeed(form.buyerAddress, effectiveTokenURI, { value: valueWei });
+          tx = await contract.mintDeed(account, effectiveTokenURI, { value: valueWei });
         } else {
           throw new Error("Contract missing executeSale/mintDeed for native ETH.");
         }
@@ -225,9 +222,9 @@ export default function DeployLandSale() {
 
         let tx;
         if (typeof contract.executeSaleERC20 === "function") {
-          tx = await contract.executeSaleERC20(form.buyerAddress, effectiveTokenURI, conf.address, value);
+          tx = await contract.executeSaleERC20(account, effectiveTokenURI, conf.address, value);
         } else if (typeof contract.mintDeedERC20 === "function") {
-          tx = await contract.mintDeedERC20(form.buyerAddress, effectiveTokenURI, conf.address, value);
+          tx = await contract.mintDeedERC20(account, effectiveTokenURI, conf.address, value);
         } else {
           throw new Error("Contract missing executeSaleERC20/mintDeedERC20.");
         }
@@ -280,8 +277,8 @@ export default function DeployLandSale() {
 
   async function createBtcInvoice() {
     try {
-      if (!form.buyerAddress || !ethers.isAddress(form.buyerAddress))
-        throw new Error("Enter a valid buyer address (0x…).");
+      if (!account || !ethers.isAddress(account))
+        throw new Error("Connect a wallet (buyer) before creating BTC invoice.");
       const btcAmt = Number(form.priceBtc);
       if (!Number.isFinite(btcAmt) || btcAmt <= 0) throw new Error("Enter a positive BTC amount.");
 
@@ -290,8 +287,10 @@ export default function DeployLandSale() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           amountBtc: String(btcAmt),
-          buyerAddress: form.buyerAddress,
+          buyerAddress: account, // mint recipient handled as connected buyer
           memo: invoiceMemo,
+          // You may also send form.sellerWallet to backend if needed for payout routing
+          sellerWallet: form.sellerWallet || null,
         }),
       });
       if (!res.ok) throw new Error("Server refused BTC invoice creation.");
@@ -320,9 +319,10 @@ export default function DeployLandSale() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: btcInvoice.id,
-          buyerAddress: form.buyerAddress,
+          buyerAddress: account,         // mint to connected buyer
           tokenURI: effectiveTokenURI,
           contractAddress,
+          sellerWallet: form.sellerWallet || null, // optional metadata
         }),
       });
       if (!fin.ok) throw new Error("Finalize failed on backend.");
@@ -350,9 +350,6 @@ export default function DeployLandSale() {
         return "";
     }
   }, [form.assetType]);
-
-  const autoBuyer =
-    account && form.buyerAddress && form.buyerAddress.toLowerCase() === account.toLowerCase();
 
   return (
     <div style={styles.container}>
@@ -421,34 +418,33 @@ export default function DeployLandSale() {
                 <span>Seller Name</span>
                 <input name="sellerName" value={form.sellerName} onChange={onChange} style={styles.input} />
               </label>
+
               <label style={styles.label}>
                 <span>Seller Address (postal)</span>
                 <input name="sellerAddress" value={form.sellerAddress} onChange={onChange} style={styles.input} />
               </label>
+
+              {/* ← NEW POSITION & LABEL */}
+              <label style={styles.label}>
+                <span>Seller Address (wallet)</span>
+                <input
+                  name="sellerWallet"
+                  value={form.sellerWallet}
+                  onChange={onChange}
+                  placeholder="0x..."
+                  style={styles.input}
+                />
+                <div style={styles.fieldHint}>Seller’s receiving wallet for funds (record only).</div>
+              </label>
+
               <label style={styles.label}>
                 <span>Buyer Name</span>
                 <input name="buyerName" value={form.buyerName} onChange={onChange} style={styles.input} />
               </label>
+
               <label style={styles.label}>
                 <span>Buyer Address (postal)</span>
                 <input name="buyerAddressPostal" value={form.buyerAddressPostal} onChange={onChange} style={styles.input} />
-              </label>
-
-              {/* Buyer wallet (auto if connected) */}
-              <label style={styles.label}>
-                <span>
-                  Buyer Address (wallet){" "}
-                  {autoBuyer && <em style={styles.chipAuto}>auto from connected wallet</em>}
-                </span>
-                <input
-                  name="buyerAddress"
-                  value={form.buyerAddress}
-                  onChange={onChange}
-                  placeholder="0x..."
-                  style={{ ...styles.input, ...(autoBuyer ? styles.inputDisabled : null) }}
-                  disabled={!!autoBuyer}
-                />
-                <div style={styles.fieldHint}>Connect a wallet to auto-fill this field.</div>
               </label>
 
               {/* Auto dates (grayed out) */}
